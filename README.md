@@ -1,8 +1,8 @@
 # 2-testes-pid — Uno escravo I2C + PID de pressão
 
 Arduino Uno que atua como **escravo I2C** (`0x08`) e controla a pressão de um sistema
-via **PID real** (`Kp·e + Ki·∫e dt + Kd·de/dt`), acionando compressor (PWM em D9) e
-solenoide (D8) a partir da leitura do transmissor em **A0**.
+via **PID real** (`Kp·e + Ki·∫e dt + Kd·de/dt`), acionando compressor (PWM em D9), a
+**porta** de ar (D8) e a **descarga** (D6) a partir da leitura do transmissor em **A0**.
 
 **A faixa do sensor não é fixa:** o mestre (ESP32) informa o mínimo, o máximo e as
 tensões de referência (`Vmin`/`Vmax`), e o Uno passa a mapear o A0 nessa faixa. Aceita
@@ -15,12 +15,15 @@ faixa **negativa** (ex.: −1 a 5 bar) e qualquer unidade — o PID continua tra
 
 - **Arduino Uno** (ATmega328P)
 - Compressor 12V acionado por módulo MOSFET **HW-517** em **D9** (PWM)
-- Solenoide 12V por módulo MOSFET **HW-517** em **D8**
+- **Porta** de ar 12V por módulo MOSFET **HW-517** em **D8** — abre enquanto o motor
+  gira (gerando pressão) e fecha quando o motor para, para **segurar** a pressão
+- **Descarga** 12V (solenoide igual à do D8) por módulo MOSFET **HW-517** em **D6** —
+  descer a pressão, despressurizar, aliviar e **alívio de segurança**
 - Transmissor de pressão em **A0** — faixa e tipo definidos pelo mestre
 
 > Módulos HW-517 são *low-side*: `VIN+`/`OUT+` ficam em continuidade.
 > Recomendado: **diodo de roda livre** em cada carga indutiva, GND comum com a fonte
-> de 12V e **pull-down de 10k** nos gatilhos D8/D9.
+> de 12V e **pull-down de 10k** nos gatilhos D6/D8/D9.
 
 ### Sensores suportados
 
@@ -86,20 +89,28 @@ histerese de 1,0 PSI, ventilação em overshoot, rampa de subida e pausa de 2 s 
 |---|---|---|
 | `1` | float `sp` (PSI) | ir para o setpoint |
 | `2` | — | parar (segura) |
-| `3` | — | ventilar |
-| `4` | 4 floats: `min, max, Vmin, Vmax` | configura a faixa do sensor |
+| `3` | — | despressurizar / ventilar (abre a descarga D6) |
+| `4` | 5 floats: `min, max, Vmin, Vmax, limite` | configura a faixa do sensor + limite de pressão |
 | `5` | 1 byte `pwm` (0..255) | PWM fixo (modo manual; 0 = para) |
 | `6` | float `offset` (PSI) | ajuste de zero, somado a toda leitura do A0 |
 
 - `min`/`max`: faixa de engenharia em **PSI** (aceita negativo). O mestre já converte a
   unidade escolhida (Bar, kgf/cm², …) para PSI antes de enviar.
 - `Vmin`/`Vmax`: tensão que o A0 entrega no mínimo e no máximo.
+- `limite` (5º float): **pressão de segurança** em PSI. Vem do mestre como o topo da
+  **maior faixa configurada entre A1..A4** (`0` = proteção desligada). Se a leitura
+  **sem o clamp da faixa** passar disso, o Uno corta o motor, fecha a porta, abre a
+  descarga e responde `status 4`. Fecha sozinho quando a pressão cai 0,5 PSI abaixo do
+  limite (histerese). Com o limite ativo, alvos (`cmd 1`) e PWM manual (`cmd 5`) são
+  **ignorados**.
 - `offset` (cmd 6): corrige o zero do transmissor/shunt. Fica na **EEPROM** junto da faixa
-  (`magic 0xCA12`) e o mestre reenvia a cada 5 s (e ao resetar), então sobrevive ao boot.
+  e do limite (`magic 0xCA13`) e o mestre reenvia a cada 5 s (e ao resetar), então
+  sobrevive ao boot.
 
 **Escravo → Mestre:** 6 bytes `[float pv(PSI), status, pwm]`
 
-- `status`: `0`=subindo · `1`=no ponto · `2`=parado · `3`=ventilando
+- `status`: `0`=subindo · `1`=no ponto · `2`=parado · `3`=despressurizando ·
+  **`4`=limite de pressão ultrapassado**
 
 A resposta usa valores em **cache** (a leitura do ADC fica no `loop`, nunca dentro da ISR),
 para não travar o barramento. A config da faixa é aplicada na própria ISR, para valer já no
@@ -144,3 +155,13 @@ pio run -t upload       # compila e grava (opcional: --upload-port COMx)
 - **rev.10:** **ajuste de zero** (`cmd 6`): o offset em PSI é somado à leitura do A0 antes
   do `constrain` e gravado na **EEPROM** com a faixa (`magic 0xCA12`, campo `off`). Config e
   zero iguais aos atuais não regravam a EEPROM nem poluem o log (o mestre reenvia a cada 5 s).
+- **rev.11:** **duas válvulas**. `D8` virou **porta** (abre enquanto o motor gira, fecha
+  quando o motor para e **segura** a pressão) e a **descarga** nova em `D6` passou a ser a
+  única via de alívio: descida, despressurizar/ventilar e segurança. Na descida o **motor
+  fica parado** e a `D6` **pulsa** (largura de pulso numa janela de 1 s) — a taxa de queda
+  (alvo 0,15…0,8 PSI/s) ajusta a **% de abertura** (`passo = 120·erro_de_taxa`, ±35 por
+  janela, taxa filtrada para não brigar com o ruído do A0). **Proteção de pressão**: o
+  `cmd 4` ganhou o 5º float `limite` (topo da maior faixa de A1..A4) — se a leitura **sem
+  clamp** passar disso, corta o motor, abre a `D6` e responde `status 4`; normaliza 0,5 PSI
+  abaixo do limite. EEPROM agora com `magic 0xCA13` (campo `lim`). Log ganhou `duty=`,
+  `desc=` e `lim=`.
